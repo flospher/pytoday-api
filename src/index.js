@@ -21,20 +21,21 @@ export default {
     ];
     const randomUA = userAgents[Math.floor(Math.random() * userAgents.length)];
 
-    const fetchHeaders = {
+    const headers = {
       "User-Agent": randomUA,
       "Accept": "*/*",
       "Cache-Control": "no-cache"
     };
 
     try {
-      // IMAGE
+      // IMAGE GENERATION
       if (path.startsWith("/image") || path.startsWith("/img")) {
-        let prompt = url.search]={url.searchParams.get("prompt") || url.searchParams.get("q");
-        if (!prompt && path.length > 7) prompt = decodeURIComponent(path.slice(7));
-
+        let prompt = url.searchParams.get("prompt") || url.searchParams.get("q");
+        if (!prompt && path.length > 7) {
+          prompt = decodeURIComponent(path.substring(7));
+        }
         if (!prompt) {
-          return new Response("Error: Add a prompt → /image/a cat in space", { status: 400, headers: corsHeaders });
+          return new Response("Missing prompt → /image/a cat wearing sunglasses", { status: 400, headers: corsHeaders });
         }
 
         const params = new URLSearchParams(url.searchParams);
@@ -43,25 +44,25 @@ export default {
         params.set("private", "true");
         if (!params.get("model")) params.set("model", "flux");
 
-        const target = `https://image.pollinations.ai/prompt/${encodeURIComponent(prompt)}?${params}`;
-        const res = await fetch(target, { headers: fetchHeaders });
+        const target = "https://image.pollinations.ai/prompt/" + encodeURIComponent(prompt) + "?" + params;
+        const res = await fetch(target, { headers });
         const buffer = await res.arrayBuffer();
 
         return new Response(buffer, {
           headers: {
             ...corsHeaders,
             "Content-Type": "image/jpeg",
-            "Cache-Control": `public, max-age=${env.CACHE_TTL}`
+            "Cache-Control": "public, max-age=" + (env.CACHE_TTL || 31536000)
           }
         });
       }
 
-      // TEXT
+      // TEXT GENERATION
       if (path.startsWith("/text")) {
-        const prompt = path.length > 6 ? decodeURIComponent(path.slice(6)) : "Hello";
+        let prompt = path.length > 6 ? decodeURIComponent(path.substring(6)) : "Hello";
         const params = new URLSearchParams(url.searchParams);
-        const target = `https://text.pollinations.ai/${encodeURIComponent(prompt)}?${params}`;
-        const res = await fetch(target, { headers: fetchHeaders });
+        const target = "https://text.pollinations.ai/" + encodeURIComponent(prompt) + "?" + params;
+        const res = await fetch(target, { headers });
         const text = await res.text();
 
         return new Response(text, {
@@ -69,15 +70,15 @@ export default {
         });
       }
 
-      // OPENAI CHAT
+      // OPENAI COMPATIBLE CHAT
       if (path === "/chat" || path === "/openai" || path === "/v1/chat/completions") {
         if (request.method !== "POST") {
-          return new Response("Method not allowed – use POST", { status: 405, headers: corsHeaders });
+          return new Response("Use POST method", { status: 405, headers: corsHeaders });
         }
         const payload = await request.json();
         const res = await fetch("https://text.pollinations.ai/openai", {
           method: "POST",
-          headers: { "Content-Type": "application/json", ...fetchHeaders },
+          headers: { "Content-Type": "application/json", ...headers },
           body: JSON.stringify(payload)
         });
         const data = await res.json();
@@ -86,12 +87,12 @@ export default {
         });
       }
 
-      // AUDIO
+      // AUDIO TTS
       if (path.startsWith("/audio")) {
-        const text = path.length > 7 ? decodeURIComponent(path.slice(7)) : "Hello world";
+        const text = path.length > 7 ? decodeURIComponent(path.substring(7)) : "Hello world";
         const voice = url.searchParams.get("voice") || "alloy";
-        const target = `https://text.pollinations.ai/${encodeURIComponent(text)}?model=openai-audio&voice=${voice}`;
-        const res = await fetch(target, { headers: fetchHeaders });
+        const target = "https://text.pollinations.ai/" + encodeURIComponent(text) + "?model=openai-audio&voice=" + voice;
+        const res = await fetch(target, { headers });
         const buffer = await res.arrayBuffer();
 
         return new Response(buffer, {
@@ -101,14 +102,14 @@ export default {
 
       // HOME PAGE
       return new Response(`
-Pollinations.ai Proxy – Fully Working
+Pollinations.ai Proxy API – LIVE & UNLIMITED
 
-/image/a beautiful sunset
-/text/Write a story about AI
+/image/beautiful girl in cyberpunk city
+/text/Write a love poem
 POST /chat → OpenAI compatible
 /audio/Hello world?voice=nova
 
-No API key • No rate limits • Forever free
+No API key • No rate limits • Forever yours
       `.trim(), {
         headers: { ...corsHeaders, "Content-Type": "text/plain" }
       });
