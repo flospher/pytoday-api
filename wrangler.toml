@@ -1,4 +1,4 @@
-name = "pollinations-proxy"
+name = "pytoday-api"
 main = "src/index.js"
 compatibility_date = "2025-11-20"
 
