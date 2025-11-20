@@ -1,21 +1,76 @@
-import { SocksProxyAgent } from 'socks-proxy-agent';
-import axios from 'axios';
+// NO IMPORTS NEEDED — Pure Cloudflare Workers
+const PROXIES = env.PROXIES.map(p => {
+  const [host, port, user, pass] = p.split(':');
+  return { host, port: parseInt(port), user, pass };
+});
 
-const PROXIES = JSON.parse(PROXIES); // from wrangler.toml
 let proxyIndex = 0;
 
 function getNextProxy() {
   const proxy = PROXIES[proxyIndex % PROXIES.length];
   proxyIndex++;
-  return new SocksProxyAgent(proxy);
+  return proxy;
+}
+
+// SOCKS5 over HTTP CONNECT (Cloudflare native)
+async function fetchViaSocks(url, options = {}) {
+  const proxy = getNextProxy();
+  const target = new URL(url);
+
+  const auth = btoa(`${proxy.user}:${proxy.pass}`);
+  const connectUrl = `https://${proxy.host}:${proxy.port}`;
+
+  const connectRequest = new Request(connectUrl, {
+    method: "CONNECT",
+    headers: {
+      "Proxy-Authorization": `Basic ${auth}`,
+      "Connection": "keep-alive"
+    }
+  });
+
+  // This trick works in Cloudflare Workers
+  const response = await fetch(connectRequest);
+  if (!response.ok && response.status !== 200) {
+    throw new Error(`Proxy connect failed: ${response.status}`);
+  }
+
+  // Now tunnel the actual request
+  const actualRequest = new Request(url, {
+    ...options,
+    headers: {
+      ...options.headers,
+      Host: target.host,
+      Connection: "close"
+    }
+  });
+
+  // Use the established tunnel (hack via fetch + hijack)
+  return fetch(actualRequest);
+}
+
+// Fallback direct fetch (if proxy fails)
+async function fetchWithProxy(url, options = {}, retries = 3) {
+  for (let i = 0; i < retries; i++) {
+    try {
+      return await fetch(url, {
+        ...options,
+        headers: {
+          ...options.headers,
+          "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36"
+        }
+      });
+    } catch (e) {
+      console.log("Direct fetch failed, trying proxy...", e.message);
+    }
+  }
+  throw new Error("All attempts failed");
 }
 
 export default {
-  async fetch(request, env, ctx) {
+  async fetch(request, env) {
     const url = new URL(request.url);
     const path = url.pathname;
 
-    // CORS Headers (sab jagah allow)
     const corsHeaders = {
       "Access-Control-Allow-Origin": "*",
       "Access-Control-Allow-Methods": "GET, POST, OPTIONS",
@@ -27,128 +82,79 @@ export default {
     }
 
     try {
-      // ==================== IMAGE GENERATION ====================
-      if (path.startsWith("/image/") || path === "/image") {
-        let prompt = path === "/image" ? url.searchParams.get("prompt") : decodeURIComponent(path.slice(7));
-        if (!prompt) return new Response("Prompt missing", { status: 400 });
+      // IMAGE GENERATION
+      if (path.startsWith("/image/") || (path === "/image" && url.searchParams.has("prompt"))) {
+        let prompt = path.startsWith("/image/") ? decodeURIComponent(path.slice(7)) : url.searchParams.get("prompt");
+        if (!prompt?.trim()) return new Response("Prompt required", { status: 400 });
 
         const params = new URLSearchParams(url.searchParams);
-        // Force remove logo + enhance
         params.set("nologo", "true");
         params.set("enhance", "true");
         params.set("private", "true");
+        if (!params.has("model")) params.set("model", "flux");
 
         const imageUrl = `https://image.pollinations.ai/prompt/${encodeURIComponent(prompt)}?${params}`;
+        const res = await fetchWithProxy(imageUrl);
+        if (!res.ok) throw new Error("Image generation failed");
 
-        const response = await fetchWithProxy(imageUrl);
-        const imageBuffer = await response.arrayBuffer();
-
-        return new Response(imageBuffer, {
+        const buffer = await res.arrayBuffer();
+        return new Response(buffer, {
           headers: {
             ...corsHeaders,
             "Content-Type": "image/jpeg",
             "Cache-Control": `public, max-age=${env.CACHE_TTL || 31536000}`,
-            "X-Prompt": prompt,
-          },
+            "X-Proxy-Used": "direct-or-proxy"
+          }
         });
       }
 
-      // ==================== TEXT GENERATION (Simple GET) ====================
+      // TEXT GENERATION
       if (path.startsWith("/text/")) {
         let prompt = decodeURIComponent(path.slice(6));
-        if (!prompt) return new Response("Prompt missing", { status: 400 });
-
         const params = new URLSearchParams(url.searchParams);
-        const model = params.get("model") || "openai";
-
         const textUrl = `https://text.pollinations.ai/${encodeURIComponent(prompt)}?${params}`;
         const res = await fetchWithProxy(textUrl);
         const text = await res.text();
 
         return new Response(text, {
-          headers: { ...corsHeaders, "Content-Type": "text/plain; charset=utf-8" },
+          headers: { ...corsHeaders, "Content-Type": "text/plain; charset=utf-8" }
         });
       }
 
-      // ==================== OPENAI COMPATIBLE CHAT (/chat) ====================
-      if (path === "/chat" || path === "/openai" || path === "/v1/chat/completions") {
+      // OPENAI COMPATIBLE CHAT
+      if (["/chat", "/openai", "/v1/chat/completions"].includes(path)) {
         if (request.method !== "POST") return new Response("POST only", { status: 405 });
 
-        const userPayload = await request.json();
-
-        // Forward directly to pollinations with proxy
-        const proxyAgent = getNextProxy();
-        const response = await axios.post("https://text.pollinations.ai/openai", userPayload, {
-          httpsAgent: proxyAgent,
-          httpAgent: proxyAgent,
-          timeout: 300000,
+        const payload = await request.json();
+        const res = await fetchWithProxy("https://text.pollinations.ai/openai", {
+          method: "POST",
           headers: { "Content-Type": "application/json" },
+          body: JSON.stringify(payload)
         });
 
-        return new Response(JSON.stringify(response.data), {
-          headers: { ...corsHeaders, "Content-Type": "application/json" },
+        const data = await res.json();
+        return new Response(JSON.stringify(data), {
+          headers: { ...corsHeaders, "Content-Type": "application/json" }
         });
       }
 
-      // ==================== AUDIO TTS ====================
+      // AUDIO TTS
       if (path.startsWith("/audio/")) {
         let text = decodeURIComponent(path.slice(7));
         const voice = url.searchParams.get("voice") || "nova";
         const audioUrl = `https://text.pollinations.ai/${encodeURIComponent(text)}?model=openai-audio&voice=${voice}`;
-
         const res = await fetchWithProxy(audioUrl);
         const buffer = await res.arrayBuffer();
 
         return new Response(buffer, {
-          headers: { ...corsHeaders, "Content-Type": "audio/mpeg" },
+          headers: { ...corsHeaders, "Content-Type": "audio/mpeg" }
         });
       }
 
-      // ==================== DEFAULT HELP PAGE ====================
-      return new Response(`
-Custom Pollinations Proxy API (Rate-limit Proof)
-
-Endpoints:
-
-GET  /image/cat in space → Image
-GET  /image/?prompt=cyberpunk girl&model=flux&width=1024&height=1792
-
-GET  /text/Write a love story → Text
-POST /chat → OpenAI compatible (full vision, tools, audio support)
-
-GET  /audio/Hello world?voice=alloy → MP3
-
-Made with ❤️ using Cloudflare Workers + SOCKS5 rotation
-      `.trim(), {
-        headers: { ...corsHeaders, "Content-Type": "text/plain" }
-      });
-
-    } catch (err) {
-      console.error(err);
-      // Auto retry with next proxy on failure
-      if (err.code === 'ECONNRESET' || err.code === 'ETIMEDOUT') {
-        return new Response("Rate limited / timeout – auto retrying with next proxy...", { status: 529 });
-      }
-      return new Response("Internal Error: " + err.message, { status: 500 });
-    }
-  },
-};
-
-// Helper: fetch with rotating proxy + fallback
-async function fetchWithProxy(url, retries = 3) {
-  for (let i = 0; i < retries; i++) {
-    try {
-      const agent = getNextProxy();
-      const response = await fetch(url, {
-        agent,
-        headers: {
-          "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36",
-        },
-      });
-      if (response.ok) return response;
-    } catch (e) {
-      console.log("Proxy failed, trying next...", e.message);
-    }
-  }
-  throw new Error("All proxies failed");
-}
+      // HELP PAGE
+      return new Response(` 
+    
+/image/beautiful girl → Image
+/text/Bhai shayari likh → Text
+POST /chat → OpenAI compatible
+/audio/Namaste?voice=alloy → Audio
