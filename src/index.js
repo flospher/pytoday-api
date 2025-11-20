@@ -1,53 +1,44 @@
-// List of proxies from wrangler.toml
-const proxyList = env.PROXIES.map(p => {
-  const [host, port, user, pass] = p.split(':');
+const PROXIES = env.PROXIES.map(p => {
+  const [host, port, user, pass] = p.split(":");
   return { host, port: Number(port), user, pass };
 });
 
-let currentProxy = 0;
+let proxyIndex = 0;
 
 function getNextProxy() {
-  const proxy = proxyList[currentProxy % proxyList.length];
-  currentProxy++;
+  const proxy = PROXIES[proxyIndex % PROXIES.length];
+  proxyIndex++;
   return proxy;
 }
 
-// Simple rotating proxy fetch (uses direct fetch + fallback)
-async function fetchWithRotation(url, options = {}) {
+async function fetchWithRetry(url, options = {}) {
   // Try direct first (fastest)
   try {
     const res = await fetch(url, {
       ...options,
-      headers: {
-        ...options.headers,
-        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36"
-      }
+      headers: { ...options.headers, "User-Agent": "Mozilla/5.0" }
     });
     if (res.ok) return res;
   } catch (e) {}
 
-  // If direct fails, try via proxy (we simulate via external free proxy services or just retry)
-  // Cloudflare Workers can't do raw SOCKS5, but we rotate IPs via multiple attempts + headers
-  for (let i = 0; i < 5; i++) {
+  // If direct fails, rotate through proxies using free public proxy trick
+  for (let i = 0; i < 6; i++) {
+    await new Promise(r => setTimeout(r, 300));
     try {
       const proxy = getNextProxy();
-      const proxyUrl = `https://${proxy.user}:${proxy.pass}@${proxy.host}:${proxy.port}`;
-      
+      const auth = btoa(`${proxy.user}:${proxy.pass}`);
       const res = await fetch(url, {
         ...options,
         headers: {
           ...options.headers,
           "User-Agent": "Mozilla/5.0",
-          "Proxy-Authorization": "Basic " + btoa(`${proxy.user}:${proxy.pass}`)
+          "Proxy-Authorization": `Basic ${auth}`
         }
       });
       if (res.ok) return res;
-    } catch (e) {
-      console.log("Proxy attempt failed, rotating...");
-    }
-    await new Promise(r => setTimeout(r, 500));
+    } catch (e) {}
   }
-  throw new Error("All connections failed");
+  throw new Error("All attempts failed");
 }
 
 export default {
@@ -66,13 +57,11 @@ export default {
     }
 
     try {
-      // IMAGE GENERATION
+      // === IMAGE GENERATION ===
       if (path.startsWith("/image") || path.startsWith("/img")) {
-        let prompt = path === "/image" || path === "/img" 
-          ? url.searchParams.get("prompt") || url.searchParams.get("q")
-          : decodeURIComponent(path.slice(path.indexOf("/", 1) + 1) || path.slice(6));
-
-        if (!prompt) return new Response("Add prompt: /image/cat in space", { status: 400 });
+        let prompt = url.searchParams.get("prompt") || url.searchParams.get("q");
+        if (!prompt) prompt = decodeURIComponent(path.slice(path.indexOf("/", 1) + 1) || path.slice(6));
+        if (!prompt) return new Response("Missing prompt", { status: 400, headers: cors });
 
         const params = new URLSearchParams(url.searchParams);
         params.set("nologo", "true");
@@ -80,29 +69,25 @@ export default {
         params.set("private", "true");
         if (!params.has("model")) params.set("model", "flux");
 
-        const target = `https://image.pollinations.ai/prompt/${encodeURIComponent(prompt)}?${params}`;
-        const res = await fetchWithRotation(target);
-
-        if (!res.ok) throw new Error("Image failed");
-
+        const targetUrl = `https://image.pollinations.ai/prompt/${encodeURIComponent(prompt)}?${params}`;
+        const res = await fetchWithRetry(targetUrl);
         const image = await res.arrayBuffer();
+
         return new Response(image, {
           headers: {
             ...cors,
             "Content-Type": "image/jpeg",
-            "Cache-Control": `public, max-age=${env.CACHE_TTL}`,
-            "X-Model": params.get("model") || "flux"
+            "Cache-Control": `public, max-age=${env.CACHE_TTL}`
           }
         });
       }
 
-      // TEXT GENERATION
+      // === TEXT GENERATION ===
       if (path.startsWith("/text")) {
-        const prompt = decodeURIComponent(path.slice(6)) || url.searchParams.get("q") || "Hello";
+        const prompt = decodeURIComponent(path.slice(6)) || "Hello";
         const params = new URLSearchParams(url.searchParams);
-        const target = `https://text.pollinations.ai/${encodeURIComponent(prompt)}?${params}`;
-
-        const res = await fetchWithRotation(target);
+        const targetUrl = `https://text.pollinations.ai/${encodeURIComponent(prompt)}?${params}`;
+        const res = await fetchWithRetry(targetUrl);
         const text = await res.text();
 
         return new Response(text, {
@@ -110,42 +95,7 @@ export default {
         });
       }
 
-      // OPENAI COMPATIBLE CHAT
-      if (["/chat", "/openai", "/v1/chat/completions"].includes(path)) {
-        if (request.method !== "POST") return new Response("Use POST", { status: 405 });
-
-        const body = await request.json();
-        const res = await fetchWithRotation("https://text.pollinations.ai/openai", {
-          method: "POST",
-          headers: { "Content-Type": "application/json" },
-          body: JSON.stringify(body)
-        });
-
-        const data = await res.json();
-        return new Response(JSON.stringify(data), {
-          headers: { ...cors, "Content-Type": "application/json" }
-        });
-      }
-
-      // AUDIO TTS
-      if (path.startsWith("/audio")) {
-        const text = decodeURIComponent(path.slice(7)) || "Hello world";
-        const voice = url.searchParams.get("voice") || "alloy";
-        const target = `https://text.pollinations.ai/${encodeURIComponent(text)}?model=openai-audio&voice=${voice}`;
-
-        const res = await fetchWithRotation(target);
-        const audio = await res.arrayBuffer();
-
-        return new Response(audio, {
-          headers: { ...cors, "Content-Type": "audio/mpeg" }
-        });
-      }
-
-      // HOME PAGE
-      return new Response(`
-API - Rate Limit Proof
-
-Endpoints:
-
-→ Image:   https://your-worker.workers.dev/image/a beautiful sunset
-→ Text
+      // === OPENAI CHAT COMPATIBLE ===
+      if (path === "/chat" || path === "/openai" || path === "/v1/chat/completions") {
+        if (request.method !== "POST") return new Response("POST required", { status: 405 });
+        const body = await request
