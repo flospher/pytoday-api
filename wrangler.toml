@@ -2,12 +2,11 @@ name = "pytoday-api"
 main = "src/index.js"
 compatibility_date = "2025-11-20"
 
-# Ye sahi syntax hai TOML array ka
 [vars]
 PROXIES = [
-  "socks5://KkQ7ob2myPlER2WE:KkQ7ob2myPlER2WE@109.104.153.100:12081",
-  "socks5://cbzPi5W8ut8kwVc6:cbzPi5W8ut8kwVc6@109.104.153.29:11657",
-  "socks5://gHw4zueog2SxDYRn:gHw4zueog2SxDYRn@109.104.153.29:10094"
+  "109.104.153.100:12081:KkQ7ob2myPlER2WE:KkQ7ob2myPlER2WE",
+  "109.104.153.29:11657:cbzPi5W8ut8kwVc6:cbzPi5W8ut8kwVc6",
+  "109.104.153.29:10094:gHw4zueog2SxDYRn:gHw4zueog2SxDYRn"
 ]
 
-CACHE_TTL = "31536000"  # 1 year image cache
+CACHE_TTL = "31536000"
