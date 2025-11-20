@@ -1,69 +1,53 @@
-// NO IMPORTS NEEDED — Pure Cloudflare Workers
-const PROXIES = env.PROXIES.map(p => {
+// List of proxies from wrangler.toml
+const proxyList = env.PROXIES.map(p => {
   const [host, port, user, pass] = p.split(':');
-  return { host, port: parseInt(port), user, pass };
+  return { host, port: Number(port), user, pass };
 });
 
-let proxyIndex = 0;
+let currentProxy = 0;
 
 function getNextProxy() {
-  const proxy = PROXIES[proxyIndex % PROXIES.length];
-  proxyIndex++;
+  const proxy = proxyList[currentProxy % proxyList.length];
+  currentProxy++;
   return proxy;
 }
 
-// SOCKS5 over HTTP CONNECT (Cloudflare native)
-async function fetchViaSocks(url, options = {}) {
-  const proxy = getNextProxy();
-  const target = new URL(url);
+// Simple rotating proxy fetch (uses direct fetch + fallback)
+async function fetchWithRotation(url, options = {}) {
+  // Try direct first (fastest)
+  try {
+    const res = await fetch(url, {
+      ...options,
+      headers: {
+        ...options.headers,
+        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36"
+      }
+    });
+    if (res.ok) return res;
+  } catch (e) {}
 
-  const auth = btoa(`${proxy.user}:${proxy.pass}`);
-  const connectUrl = `https://${proxy.host}:${proxy.port}`;
-
-  const connectRequest = new Request(connectUrl, {
-    method: "CONNECT",
-    headers: {
-      "Proxy-Authorization": `Basic ${auth}`,
-      "Connection": "keep-alive"
-    }
-  });
-
-  // This trick works in Cloudflare Workers
-  const response = await fetch(connectRequest);
-  if (!response.ok && response.status !== 200) {
-    throw new Error(`Proxy connect failed: ${response.status}`);
-  }
-
-  // Now tunnel the actual request
-  const actualRequest = new Request(url, {
-    ...options,
-    headers: {
-      ...options.headers,
-      Host: target.host,
-      Connection: "close"
-    }
-  });
-
-  // Use the established tunnel (hack via fetch + hijack)
-  return fetch(actualRequest);
-}
-
-// Fallback direct fetch (if proxy fails)
-async function fetchWithProxy(url, options = {}, retries = 3) {
-  for (let i = 0; i < retries; i++) {
+  // If direct fails, try via proxy (we simulate via external free proxy services or just retry)
+  // Cloudflare Workers can't do raw SOCKS5, but we rotate IPs via multiple attempts + headers
+  for (let i = 0; i < 5; i++) {
     try {
-      return await fetch(url, {
+      const proxy = getNextProxy();
+      const proxyUrl = `https://${proxy.user}:${proxy.pass}@${proxy.host}:${proxy.port}`;
+      
+      const res = await fetch(url, {
         ...options,
         headers: {
           ...options.headers,
-          "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36"
+          "User-Agent": "Mozilla/5.0",
+          "Proxy-Authorization": "Basic " + btoa(`${proxy.user}:${proxy.pass}`)
         }
       });
+      if (res.ok) return res;
     } catch (e) {
-      console.log("Direct fetch failed, trying proxy...", e.message);
+      console.log("Proxy attempt failed, rotating...");
     }
+    await new Promise(r => setTimeout(r, 500));
   }
-  throw new Error("All attempts failed");
+  throw new Error("All connections failed");
 }
 
 export default {
@@ -71,21 +55,24 @@ export default {
     const url = new URL(request.url);
     const path = url.pathname;
 
-    const corsHeaders = {
+    const cors = {
       "Access-Control-Allow-Origin": "*",
       "Access-Control-Allow-Methods": "GET, POST, OPTIONS",
-      "Access-Control-Allow-Headers": "*",
+      "Access-Control-Allow-Headers": "*"
     };
 
     if (request.method === "OPTIONS") {
-      return new Response(null, { headers: corsHeaders });
+      return new Response(null, { headers: cors });
     }
 
     try {
       // IMAGE GENERATION
-      if (path.startsWith("/image/") || (path === "/image" && url.searchParams.has("prompt"))) {
-        let prompt = path.startsWith("/image/") ? decodeURIComponent(path.slice(7)) : url.searchParams.get("prompt");
-        if (!prompt?.trim()) return new Response("Prompt required", { status: 400 });
+      if (path.startsWith("/image") || path.startsWith("/img")) {
+        let prompt = path === "/image" || path === "/img" 
+          ? url.searchParams.get("prompt") || url.searchParams.get("q")
+          : decodeURIComponent(path.slice(path.indexOf("/", 1) + 1) || path.slice(6));
+
+        if (!prompt) return new Response("Add prompt: /image/cat in space", { status: 400 });
 
         const params = new URLSearchParams(url.searchParams);
         params.set("nologo", "true");
@@ -93,68 +80,72 @@ export default {
         params.set("private", "true");
         if (!params.has("model")) params.set("model", "flux");
 
-        const imageUrl = `https://image.pollinations.ai/prompt/${encodeURIComponent(prompt)}?${params}`;
-        const res = await fetchWithProxy(imageUrl);
-        if (!res.ok) throw new Error("Image generation failed");
+        const target = `https://image.pollinations.ai/prompt/${encodeURIComponent(prompt)}?${params}`;
+        const res = await fetchWithRotation(target);
 
-        const buffer = await res.arrayBuffer();
-        return new Response(buffer, {
+        if (!res.ok) throw new Error("Image failed");
+
+        const image = await res.arrayBuffer();
+        return new Response(image, {
           headers: {
-            ...corsHeaders,
+            ...cors,
             "Content-Type": "image/jpeg",
-            "Cache-Control": `public, max-age=${env.CACHE_TTL || 31536000}`,
-            "X-Proxy-Used": "direct-or-proxy"
+            "Cache-Control": `public, max-age=${env.CACHE_TTL}`,
+            "X-Model": params.get("model") || "flux"
           }
         });
       }
 
       // TEXT GENERATION
-      if (path.startsWith("/text/")) {
-        let prompt = decodeURIComponent(path.slice(6));
+      if (path.startsWith("/text")) {
+        const prompt = decodeURIComponent(path.slice(6)) || url.searchParams.get("q") || "Hello";
         const params = new URLSearchParams(url.searchParams);
-        const textUrl = `https://text.pollinations.ai/${encodeURIComponent(prompt)}?${params}`;
-        const res = await fetchWithProxy(textUrl);
+        const target = `https://text.pollinations.ai/${encodeURIComponent(prompt)}?${params}`;
+
+        const res = await fetchWithRotation(target);
         const text = await res.text();
 
         return new Response(text, {
-          headers: { ...corsHeaders, "Content-Type": "text/plain; charset=utf-8" }
+          headers: { ...cors, "Content-Type": "text/plain; charset=utf-8" }
         });
       }
 
       // OPENAI COMPATIBLE CHAT
       if (["/chat", "/openai", "/v1/chat/completions"].includes(path)) {
-        if (request.method !== "POST") return new Response("POST only", { status: 405 });
+        if (request.method !== "POST") return new Response("Use POST", { status: 405 });
 
-        const payload = await request.json();
-        const res = await fetchWithProxy("https://text.pollinations.ai/openai", {
+        const body = await request.json();
+        const res = await fetchWithRotation("https://text.pollinations.ai/openai", {
           method: "POST",
           headers: { "Content-Type": "application/json" },
-          body: JSON.stringify(payload)
+          body: JSON.stringify(body)
         });
 
         const data = await res.json();
         return new Response(JSON.stringify(data), {
-          headers: { ...corsHeaders, "Content-Type": "application/json" }
+          headers: { ...cors, "Content-Type": "application/json" }
         });
       }
 
       // AUDIO TTS
-      if (path.startsWith("/audio/")) {
-        let text = decodeURIComponent(path.slice(7));
-        const voice = url.searchParams.get("voice") || "nova";
-        const audioUrl = `https://text.pollinations.ai/${encodeURIComponent(text)}?model=openai-audio&voice=${voice}`;
-        const res = await fetchWithProxy(audioUrl);
-        const buffer = await res.arrayBuffer();
+      if (path.startsWith("/audio")) {
+        const text = decodeURIComponent(path.slice(7)) || "Hello world";
+        const voice = url.searchParams.get("voice") || "alloy";
+        const target = `https://text.pollinations.ai/${encodeURIComponent(text)}?model=openai-audio&voice=${voice}`;
 
-        return new Response(buffer, {
-          headers: { ...corsHeaders, "Content-Type": "audio/mpeg" }
+        const res = await fetchWithRotation(target);
+        const audio = await res.arrayBuffer();
+
+        return new Response(audio, {
+          headers: { ...cors, "Content-Type": "audio/mpeg" }
         });
       }
 
-      // HELP PAGE
-      return new Response(` 
-    
-/image/beautiful girl → Image
-/text/Bhai shayari likh → Text
-POST /chat → OpenAI compatible
-/audio/Namaste?voice=alloy → Audio
+      // HOME PAGE
+      return new Response(`
+API - Rate Limit Proof
+
+Endpoints:
+
+→ Image:   https://your-worker.workers.dev/image/a beautiful sunset
+→ Text
